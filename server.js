@@ -9,17 +9,26 @@ const txnRoutes = require("./routes/txnRoutes");
 
 const app = express();
 
-// ✅ Universal CORS setup (never gives CORS error)
+// ✅ Universal CORS Setup (Compatible with Express 5)
 app.use(
   cors({
-    origin: "*", // allows requests from all origins
+    origin: "*", // Allow all origins
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// Handle preflight (OPTIONS) requests
-app.options("*", cors());
+// ✅ Safe alternative to avoid path-to-regexp '*' error
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 
 // Middleware
 app.use(bodyParser.json());
@@ -35,7 +44,7 @@ mongoose
 app.use("/api/users", userRoutes);
 app.use("/api/txns", txnRoutes);
 
-// ✅ Default route (for sanity check)
+// ✅ Default route
 app.get("/", (req, res) => {
   res.json({ message: "GramBank API is running 🚀" });
 });
