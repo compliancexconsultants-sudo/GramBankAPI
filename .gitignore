@@ -51,10 +51,12 @@ ios/build/
 # MongoDB dump files
 dump/
 *.bson
-*.json
 
 # Local data & uploads
 uploads/
 tmp/
 data/
 
+# Lock files (optional, if using cross-env setup)
+package-lock.json
+yarn.lock
