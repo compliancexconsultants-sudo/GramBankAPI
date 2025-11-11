@@ -10,6 +10,6 @@ module.exports = [
     { account: "6677889900", reason: "Impersonation of bank personnel" },
     { account: "3322110099", reason: "Fraudulent investment scheme" },
     { account: "1234432112", reason: "Used in smishing attempts" },
-    // … add up to 50 entries
+    
   ];
   

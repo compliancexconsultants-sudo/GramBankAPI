@@ -6,6 +6,7 @@ const User = require("../models/User");
 const auth = require("../middleware/auth");
 const fraudList = require("../fraudList");
 const router = express.Router();
+const FraudAccount = require("../models/FraudAccount");
 
 /**
  * Simple fraud detector (rule-based):
@@ -30,66 +31,66 @@ function simpleFraudCheck({ amount, balance_before, location_delta_km, is_foreig
  * Protected: requires JWT. Body must include to_account, ifsc, beneficiary_name, amount, optional meta fields.
  */
 router.post("/send", auth, async (req, res) => {
-    try {
-      const user = req.user;
-      const { to_account, ifsc, beneficiary_name, amount } = req.body;
-  
-      if (!to_account || !ifsc || !amount)
-        return res.status(400).json({ error: "Missing transaction details" });
-  
-      const amt = Number(amount);
-      if (amt <= 0) return res.status(400).json({ error: "Invalid amount" });
-  
-      // ✅ Step 1: Check against known fraud accounts
-      const fraudMatch = fraudList.find(f => f.account === to_account);
-      if (fraudMatch) {
-        return res.json({
-          message: "🚨 Fraudulent account detected",
-          is_fraud: true,
-          fraud_reason: fraudMatch.reason,
-          balance_before: user.balance,
-          balance_after: user.balance,
-          txn_blocked: true,
-        });
-      }
-  
-      // ✅ Step 2: Check balance
-      if (user.balance < amt)
-        return res.status(400).json({ error: "Insufficient balance" });
-  
-      // ✅ Step 3: Normal transaction
-      const balance_before = user.balance;
-      const balance_after = +(balance_before - amt).toFixed(2);
-  
-      const txn = new Transaction({
-        txn_id: `TXN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        user_id: user._id,
-        to_account,
-        ifsc,
-        beneficiary_name,
-        amount: amt,
-        balance_before,
-        balance_after,
-        is_fraud: false,
+  try {
+    const user = req.user;
+    const { to_account, ifsc, beneficiary_name, amount } = req.body;
+
+    if (!to_account || !ifsc || !amount)
+      return res.status(400).json({ error: "Missing transaction details" });
+
+    const amt = Number(amount);
+    if (amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    // ✅ Step 1: Check against known fraud accounts
+    const blacklisted = await FraudAccount.findOne({ accountNumber: to_account });
+    if (blacklisted) {
+      return res.json({
+        message: "🚨 Fraudulent account detected from DB",
+        is_fraud: true,
+        txn_blocked: true,
+        fraud_reason: "Account reported by users",
+        balance_before: user.balance,
+        balance_after: user.balance,
       });
-  
-      await txn.save();
-      user.balance = balance_after;
-      user.transactionsCount = (user.transactionsCount || 0) + 1;
-      await user.save();
-  
-      res.json({
-        message: "Transaction successful",
-        txn_id: txn.txn_id,
-        balance_before,
-        balance_after,
-        is_fraud: false,
-      });
-    } catch (err) {
-      console.error("Send txn error:", err);
-      res.status(500).json({ error: "Server error" });
     }
-  });
+
+    // ✅ Step 2: Check balance
+    if (user.balance < amt)
+      return res.status(400).json({ error: "Insufficient balance" });
+
+    // ✅ Step 3: Normal transaction
+    const balance_before = user.balance;
+    const balance_after = +(balance_before - amt).toFixed(2);
+
+    const txn = new Transaction({
+      txn_id: `TXN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      user_id: user._id,
+      to_account,
+      ifsc,
+      beneficiary_name,
+      amount: amt,
+      balance_before,
+      balance_after,
+      is_fraud: false,
+    });
+
+    await txn.save();
+    user.balance = balance_after;
+    user.transactionsCount = (user.transactionsCount || 0) + 1;
+    await user.save();
+
+    res.json({
+      message: "Transaction successful",
+      txn_id: txn.txn_id,
+      balance_before,
+      balance_after,
+      is_fraud: false,
+    });
+  } catch (err) {
+    console.error("Send txn error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 /**
  * GET /api/txns/history
@@ -163,7 +164,7 @@ router.post("/seed-fraud", auth, async (req, res) => {
       const txn = new Transaction({
         txn_id: `SEED-${Date.now()}-${i}`,
         user_id: user._id,
-        to_account: `BEN${Math.floor(Math.random()*10000)}`,
+        to_account: `BEN${Math.floor(Math.random() * 10000)}`,
         ifsc: "SEED0000",
         beneficiary_name: "Seed Beneficiary",
         amount,
@@ -195,29 +196,54 @@ router.post("/seed-fraud", auth, async (req, res) => {
 });
 
 router.get("/balance", auth, async (req, res) => {
-    try {
-      const user = req.user;
-  
-      // Fetch last 5 transactions
-      const recentTxns = await Transaction.find({ userId: user._id })
-        .sort({ createdAt: -1 })
-        .limit(5);
-  
-      res.json({
-        name: user.name,
-        aadhaarNumber: user.aadhaarNumber,
-        balance: user.balance,
-        recent: recentTxns.map((txn) => ({
-          txn_id: txn.txn_id,
-          amount: txn.amount,
-          type: txn.type,
-          createdAt: txn.createdAt,
-        })),
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Failed to fetch balance data" });
-    }
-  });
+  try {
+    const user = req.user;
+
+    // Fetch last 5 transactions
+    const recentTxns = await Transaction.find({ userId: user._id })
+      .sort({ createdAt: -1 })
+      .limit(5);
+
+    res.json({
+      name: user.name,
+      aadhaarNumber: user.aadhaarNumber,
+      balance: user.balance,
+      recent: recentTxns.map((txn) => ({
+        txn_id: txn.txn_id,
+        amount: txn.amount,
+        type: txn.type,
+        createdAt: txn.createdAt,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch balance data" });
+  }
+});
+
+// POST /api/txns/report
+router.post("/report", auth, async (req, res) => {
+  try {
+    const { accountNumber, ifsc, reason } = req.body;
+    if (!accountNumber) return res.status(400).json({ error: "Account number required" });
+
+    const existing = await FraudAccount.findOne({ accountNumber });
+    if (existing) return res.json({ message: "Account already reported" });
+
+    const report = new FraudAccount({
+      accountNumber,
+      ifsc,
+      reason,
+      reportedBy: req.user._id,
+    });
+    await report.save();
+
+    res.json({ message: "Fraudulent account reported successfully" });
+  } catch (err) {
+    console.error("Fraud report error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 
 module.exports = router;
