@@ -3,20 +3,17 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const Transaction = require("../models/Transaction");
 const User = require("../models/User");
+const Otp = require("../models/Otp"); // new: OTP model
 const auth = require("../middleware/auth");
-const fraudList = require("../fraudList");
 const router = express.Router();
 const FraudAccount = require("../models/FraudAccount");
 
-/**
- * Simple fraud detector (rule-based):
- * - amount > balance_before * 0.8  => suspicious (large)
- * - location_delta_km > 100       => suspicious (location jump)
- * - is_foreign_device == 1        => suspicious
- * - txns_last_24h > 10            => suspicious (too frequent)
- *
- * Returns { is_fraud: boolean, reason: string|null }
- */
+const accountSid = process.env.TWILIO_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+const messagingServiceSid = process.env.TWILIO_MSG_SID;
+const twilioClient = require("twilio")(accountSid, authToken);
+
+// ---- Helper: simple fraud rules ----
 function simpleFraudCheck({ amount, balance_before, location_delta_km, is_foreign_device, txns_last_24h }) {
   if (!balance_before || isNaN(balance_before)) balance_before = 0;
   if (amount > balance_before * 0.8 && balance_before > 0) return { is_fraud: true, reason: "Large txn relative to balance" };
@@ -26,24 +23,101 @@ function simpleFraudCheck({ amount, balance_before, location_delta_km, is_foreig
   return { is_fraud: false, reason: null };
 }
 
+// ---- Utility: mask account show last 4 digits ----
+function maskAccount(acc) {
+  if (!acc) return "****";
+  const s = acc.toString();
+  const last4 = s.slice(-4);
+  return "****" + last4;
+}
+
+// ---- Ensure phone in E.164 (simple +91 fallback) ----
+function formatPhone(phone) {
+  if (!phone) return phone;
+  if (phone.startsWith("+")) return phone;
+  // default to India if 10-digit number
+  if (/^\d{10}$/.test(phone)) return "+91" + phone;
+  return phone;
+}
+
+/**
+ * POST /api/txns/send-otp
+ * Protected. Sends OTP to user's registered phone (or phone passed in body).
+ */
+router.post("/send-otp", auth, async (req, res) => {
+  try {
+    const user = req.user;
+    // allow client override phone (if you stored phone separately in AsyncStorage)
+    let { phone } = req.body;
+    phone = phone || user.phone || user.mobile || user.phoneNumber;
+
+    if (!phone) return res.status(400).json({ error: "No phone number available to send OTP" });
+
+    const formattedPhone = formatPhone(phone);
+
+    // generate 4-digit OTP
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+    // save OTP record
+    await Otp.create({ phone: formattedPhone, code, expiresAt });
+
+    // send via Twilio
+    try {
+      await twilioClient.messages.create({
+        to: formattedPhone,
+        body: `Your GramBank transaction OTP is ${code}. It will expire in 5 minutes.`,
+        from: '+13326997688',
+      });
+      return res.json({ message: "OTP sent successfully", otp: code });
+    } catch (smsErr) {
+      console.error("Twilio send error:", smsErr);
+      // return success with otp for dev fallback (remove in prod)
+      return res.json({ message: "OTP generated (SMS failed)", otp: code });
+    }
+  } catch (err) {
+    console.error("Send txn OTP error:", err);
+    res.status(500).json({ error: "Failed to send transaction OTP" });
+  }
+});
+
 /**
  * POST /api/txns/send
- * Protected: requires JWT. Body must include to_account, ifsc, beneficiary_name, amount, optional meta fields.
+ * Protected. Body: { to_account, ifsc, beneficiary_name, amount, otp, phone(optional) }
+ * Verifies OTP then processes transaction. Sends debit SMS on success.
  */
 router.post("/send", auth, async (req, res) => {
   try {
     const user = req.user;
-    const { to_account, ifsc, beneficiary_name, amount } = req.body;
+    const { to_account, ifsc, beneficiary_name, amount, otp, phone } = req.body;
 
-    if (!to_account || !ifsc || !amount)
-      return res.status(400).json({ error: "Missing transaction details" });
 
+    if (!to_account || !ifsc || !amount) return res.status(400).json({ error: "Missing transaction details" });
     const amt = Number(amount);
-    if (amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
 
-    // ✅ Step 1: Check against known fraud accounts
+    // ---- Verify OTP ----
+    const phoneToCheck = formatPhone(phone || user.phone || user.mobile || user.phoneNumber);
+    if (!otp) return res.status(400).json({ error: "OTP required" });
+
+    const otpRecord = await Otp.findOne({ phone: phoneToCheck }).sort({ createdAt: -1 });
+    if (!otpRecord) return res.status(400).json({ error: "No OTP found for this phone" });
+    if (otpRecord.expiresAt < new Date()) return res.status(400).json({ error: "OTP expired" });
+    if (otpRecord.code !== otp) return res.status(400).json({ error: "Invalid OTP" });
+
+    // ---- Check fraud blacklist by account ----
     const blacklisted = await FraudAccount.findOne({ accountNumber: to_account });
     if (blacklisted) {
+      // alert user via SMS about blocked txn (optional)
+      try {
+        const msg = `Alert: A transfer to account ${maskAccount(to_account)} has been blocked for safety. If this was not you, contact GramBank immediately.`;
+        const sendMessage = await twilioClient.messages.create({
+          to: phoneToCheck, body: msg, from: '+13326997688',
+        });
+      } catch (e) {
+        console.error("Twilio alert error:", e);
+      }
+
       return res.json({
         message: "🚨 Fraudulent account detected from DB",
         is_fraud: true,
@@ -54,14 +128,51 @@ router.post("/send", auth, async (req, res) => {
       });
     }
 
-    // ✅ Step 2: Check balance
-    if (user.balance < amt)
-      return res.status(400).json({ error: "Insufficient balance" });
+    // ---- Check sufficient balance ----
+    if (user.balance < amt) return res.status(400).json({ error: "Insufficient balance" });
 
-    // ✅ Step 3: Normal transaction
+    // ---- Basic fraud rules (extendable) ----
     const balance_before = user.balance;
-    const balance_after = +(balance_before - amt).toFixed(2);
+    const fraudCheck = simpleFraudCheck({ amount: amt, balance_before });
+    if (fraudCheck.is_fraud) {
+      // create a flagged transaction but do NOT perform debit if you want to block large txns
+      const flaggedTxn = new Transaction({
+        txn_id: `TXN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        user_id: user._id,
+        to_account,
+        ifsc,
+        beneficiary_name,
+        amount: amt,
+        balance_before,
+        balance_after: balance_before, // no deduction if blocked
+        is_fraud: true,
+        fraud_reason: fraudCheck.reason,
+      });
+      await flaggedTxn.save();
+      let messageSended
+      // optional: send alert SMS to user indicating txn flagged
+      try {
+        const alertMsg = `⚠️ GramBank Alert: A ${fraudCheck.reason} transaction of ₹${amt.toFixed(2)} to ${maskAccount(to_account)} was flagged and blocked. Available balance: ₹${balance_before.toFixed(2)}.`;
+        messageSended = await twilioClient.messages.create({
+          to: phoneToCheck, body: alertMsg, from: '+13326997688',
+        });
+      } catch (e) {
+        console.error("Twilio alert error:", e);
+      }
 
+      return res.json({
+        message: "Transaction flagged as suspicious",
+        is_fraud: true,
+        txn_blocked: true,
+        fraud_reason: fraudCheck.reason,
+        balance_before,
+        balance_after: balance_before,
+        messageSended: messageSended ? messageSended.sid : 'twilio error'
+      });
+    }
+
+    // ---- Proceed with normal transaction: debit and save ----
+    const balance_after = +(balance_before - amt).toFixed(2);
     const txn = new Transaction({
       txn_id: `TXN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       user_id: user._id,
@@ -73,18 +184,30 @@ router.post("/send", auth, async (req, res) => {
       balance_after,
       is_fraud: false,
     });
-
     await txn.save();
+
+    // update user balance
     user.balance = balance_after;
     user.transactionsCount = (user.transactionsCount || 0) + 1;
     await user.save();
+    let messageBody
+    // ---- Send bank-style debit SMS to user ----
+    try {
+      const smsBody = `GramBank: Your A/c ${maskAccount(user.accountNumber || user._id)} debited ₹${amt.toFixed(2)} to ${beneficiary_name || maskAccount(to_account)} A/c ${maskAccount(to_account)}. Avl bal ₹${balance_after.toFixed(2)}. - GramBank`;
+      messageBody = await twilioClient.messages.create({
+        to: phoneToCheck, body: smsBody, from: '+13326997688',
+      });
+    } catch (smsErr) {
+      console.error("Twilio debit SMS error:", smsErr);
+    }
 
-    res.json({
+    return res.json({
       message: "Transaction successful",
       txn_id: txn.txn_id,
       balance_before,
       balance_after,
       is_fraud: false,
+      messageBody: messageBody ? messageBody?.sid : null
     });
   } catch (err) {
     console.error("Send txn error:", err);
@@ -92,11 +215,9 @@ router.post("/send", auth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/txns/history
- * Return transaction history for the logged-in user (most recent first).
- * Protected.
- */
+/* History, alerts, seed-fraud, balance, report routes — leave as before (no changes) */
+/* You already had these; re-add them unchanged below or keep existing ones in file. */
+
 router.get("/history", auth, async (req, res) => {
   try {
     const user = req.user;
@@ -108,10 +229,6 @@ router.get("/history", auth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/txns/alerts
- * Return only suspicious/fraud transactions for the user.
- */
 router.get("/alerts", auth, async (req, res) => {
   try {
     const user = req.user;
@@ -123,11 +240,6 @@ router.get("/alerts", auth, async (req, res) => {
   }
 });
 
-/**
- * POST /api/txns/seed-fraud
- * For demo: seeds ~10 fraudulent transactions for the logged-in user.
- * Protected. Creates mix of flagged txns (large amount/location jump/foreign).
- */
 router.post("/seed-fraud", auth, async (req, res) => {
   try {
     const user = req.user;
@@ -139,14 +251,13 @@ router.post("/seed-fraud", auth, async (req, res) => {
       const type = i % 3;
       let amount, location_delta_km, is_foreign_device, reason;
       if (type === 0) {
-        // Large relative amount
-        amount = Math.floor(currentBal * (0.85 + Math.random() * 0.1)); // 85-95% of balance
+        amount = Math.floor(currentBal * (0.85 + Math.random() * 0.1));
         location_delta_km = Math.floor(Math.random() * 5);
         is_foreign_device = 0;
         reason = "Large txn relative to balance";
       } else if (type === 1) {
         amount = Math.floor(500 + Math.random() * 1500);
-        location_delta_km = 150 + Math.floor(Math.random() * 500); // big jump
+        location_delta_km = 150 + Math.floor(Math.random() * 500);
         is_foreign_device = 0;
         reason = "Location jump";
       } else {
@@ -156,7 +267,7 @@ router.post("/seed-fraud", auth, async (req, res) => {
         reason = "Foreign device";
       }
 
-      if (amount > currentBal) amount = Math.floor(currentBal * 0.9); // ensure possible
+      if (amount > currentBal) amount = Math.floor(currentBal * 0.9);
       const balance_before = currentBal;
       const balance_after = +(currentBal - amount).toFixed(2);
       currentBal = balance_after;
@@ -182,7 +293,6 @@ router.post("/seed-fraud", auth, async (req, res) => {
       seeds.push(txn);
     }
 
-    // Save all and update user balance
     await Transaction.insertMany(seeds);
     user.balance = currentBal;
     user.transactionsCount = (user.transactionsCount || 0) + seeds.length;
@@ -199,8 +309,7 @@ router.get("/balance", auth, async (req, res) => {
   try {
     const user = req.user;
 
-    // Fetch last 5 transactions
-    const recentTxns = await Transaction.find({ userId: user._id })
+    const recentTxns = await Transaction.find({ user_id: user._id })
       .sort({ createdAt: -1 })
       .limit(5);
 
@@ -221,7 +330,6 @@ router.get("/balance", auth, async (req, res) => {
   }
 });
 
-// POST /api/txns/report
 router.post("/report", auth, async (req, res) => {
   try {
     const { accountNumber, ifsc, reason } = req.body;
@@ -244,6 +352,5 @@ router.post("/report", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 module.exports = router;

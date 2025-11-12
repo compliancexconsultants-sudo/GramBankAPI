@@ -1,58 +1,61 @@
 const express = require("express");
 const router = express.Router();
-const Otp = require("../models/Otp");
 const axios = require("axios");
-// Send OTP (simulated)
+const Otp = require("../models/Otp"); // your mongoose model
+const accountSid = process.env.TWILIO_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+const messagingServiceSid = process.env.TWILIO_MSG_SID;
+
+
+const client = require("twilio")(accountSid, authToken);
+
+// --- Generate OTP and send via Twilio ---
 router.post("/send", async (req, res) => {
-  try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: "Phone is required" });
+    try {
+        const { phone } = req.body;
+        if (!phone) return res.status(400).json({ error: "Phone number required" });
 
-    // Generate 4-digit OTP
-    const otp = Math.floor(1000 + Math.random() * 9000).toString();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+        const formattedPhone = phone.startsWith("+91") ? phone : `+91${phone}`;
+        const otp = Math.floor(1000 + Math.random() * 9000).toString();
+        const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // expires in 5 min
 
-    // Save in DB
-    await Otp.create({ phone, code : otp, expiresAt });
+        await Otp.create({ phone: formattedPhone, code: otp, expiresAt });
 
-    // Send OTP using Textbelt (from backend — no CORS issue)
-    const smsRes = await axios.post("https://textbelt.com/text", {
-      phone,
-      message: `Your GramBank verification code is ${otp}. It expires in 5 minutes.`,
-      key: "textbelt", // ⚠️ Free key (1 SMS/day)
-    });
+        // Send OTP SMS
+        const message = await client.messages.create({
+            body: `Your GramBank OTP is ${otp}. It expires in 5 minutes.`,
+            from: '+13326997688',
+            to: formattedPhone,
+        });
 
-    if (smsRes.data.success) {
-      res.json({ message: "OTP sent successfully" });
-    } else {
-      console.log("Textbelt error:", smsRes.data);
-      res.json({ message: "OTP generated (SMS failed)", otp }); // fallback
+        console.log("✅ OTP sent:", message.sid);
+        res.json({ success: true, otp }); // keep otp in response only for dev/test
+    } catch (err) {
+        console.error("Twilio OTP Error:", err);
+        res.status(500).json({ error: "Failed to send OTP" });
     }
-  } catch (err) {
-    console.error("OTP Send Error:", err);
-    res.status(500).json({ error: "Failed to send OTP" });
-  }
 });
 
-// Verify OTP
+// --- Verify OTP ---
 router.post("/verify", async (req, res) => {
-  const { phone, code } = req.body;
-  if (!phone || !code)
-    return res.status(400).json({ error: "Phone and code required" });
+    try {
+        const { phone, code } = req.body;
+        let otp = code
 
-  const record = await Otp.findOne({ phone, code, used: false })
-    .sort({ createdAt: -1 })
-    .exec();
+        if (!phone || !otp) return res.status(400).json({ error: "Missing fields" });
 
-  if (!record) return res.status(400).json({ error: "Invalid OTP" });
-  if (record.expiresAt < new Date())
-    return res.status(400).json({ error: "OTP expired" });
+        const formattedPhone = phone.startsWith("+91") ? phone : `+91${phone}`;
+        const record = await Otp.findOne({ phone: formattedPhone }).sort({ createdAt: -1 });
 
-  record.used = true;
-  await record.save();
+        if (!record) return res.status(400).json({ error: "No OTP found for this number" });
+        if (record.expiresAt < new Date()) return res.status(400).json({ error: "OTP expired" });
+        if (record.code !== otp) return res.status(400).json({ error: "Invalid OTP" });
 
-  // OTP verified successfully
-  res.json({ message: "OTP verified successfully" });
+        res.json({ success: true, message: "OTP verified successfully" });
+    } catch (err) {
+        console.error("Verify OTP Error:", err);
+        res.status(500).json({ error: "Failed to verify OTP" });
+    }
 });
 
 module.exports = router;
