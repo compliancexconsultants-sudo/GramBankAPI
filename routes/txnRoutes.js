@@ -190,6 +190,47 @@ router.post("/send", auth, async (req, res) => {
     user.balance = balance_after;
     user.transactionsCount = (user.transactionsCount || 0) + 1;
     await user.save();
+
+    const receiver = await User.findOne({ accountNumber: to_account });
+
+    if (receiver) {
+      const receiver_balance_before = receiver.balance;
+      const receiver_balance_after = +(receiver.balance + amt).toFixed(2);
+
+      receiver.balance = receiver_balance_after;
+      receiver.transactionsCount = (receiver.transactionsCount || 0) + 1;
+      await receiver.save();
+
+      // Create credit-side transaction
+      const creditTxn = new Transaction({
+       txn_id: `${txn.txn_id}-CREDIT`,
+        user_id: receiver._id,
+        from_account: user.accountNumber,
+        to_account: receiver.accountNumber,   // <-- ADD THIS
+        amount: amt,
+        balance_before: receiver_balance_before,
+        balance_after: receiver_balance_after,
+        is_fraud: false,
+        type: "CREDIT",
+      });
+      await creditTxn.save();
+
+      // Optional receiver SMS
+      try {
+        const phoneNumber = formatPhone(receiver.phoneNumber)
+        const creditMsg = `GramBank: Your A/c ${maskAccount(
+          receiver.accountNumber
+        )} credited ₹${amt.toFixed(2)} from ${maskAccount(user.accountNumber)}. Avl bal ₹${receiver_balance_after.toFixed(2)}.`;
+        await twilioClient.messages.create({
+          to: phoneNumber,
+          body: creditMsg,
+          from: "+13326997688",
+        });
+      } catch (e) {
+        console.error("Receiver SMS error:", e);
+      }
+    }
+
     let messageBody
     // ---- Send bank-style debit SMS to user ----
     try {
