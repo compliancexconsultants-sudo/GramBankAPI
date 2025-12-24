@@ -7,7 +7,6 @@ const Otp = require("../models/Otp"); // new: OTP model
 const auth = require("../middleware/auth");
 const router = express.Router();
 const FraudAccount = require("../models/FraudAccount");
-
 const accountSid = process.env.TWILIO_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const messagingServiceSid = process.env.TWILIO_MSG_SID;
@@ -203,7 +202,7 @@ router.post("/send", auth, async (req, res) => {
 
       // Create credit-side transaction
       const creditTxn = new Transaction({
-       txn_id: `${txn.txn_id}-CREDIT`,
+        txn_id: `${txn.txn_id}-CREDIT`,
         user_id: receiver._id,
         from_account: user.accountNumber,
         to_account: receiver.accountNumber,   // <-- ADD THIS
@@ -255,6 +254,129 @@ router.post("/send", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+/**
+ * POST /api/txns/upi/send
+ * Body: { upiId, amount, otp, phone(optional) }
+ */
+router.post("/upi/send", auth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { upiId, amount, otp, phone } = req.body;
+
+    if (!upiId || !amount) return res.status(400).json({ error: "UPI ID & Amount required" });
+
+    const amt = Number(amount);
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    // ---------- OTP VERIFY ----------
+    const phoneToCheck = formatPhone(phone || user.phoneNumber);
+    if (!otp) return res.status(400).json({ error: "OTP required" });
+
+    const otpRecord = await Otp.findOne({ phone: phoneToCheck }).sort({ createdAt: -1 });
+    if (!otpRecord) return res.status(400).json({ error: "No OTP found for this phone" });
+    if (otpRecord.expiresAt < new Date()) return res.status(400).json({ error: "OTP expired" });
+    if (otpRecord.code !== otp) return res.status(400).json({ error: "Invalid OTP" });
+
+    // ---------- FIND RECEIVER ----------
+    const receiver = await User.findOne({ upiId });
+    if (!receiver) return res.status(404).json({ error: "Receiver UPI not found" });
+
+    // ---------- BALANCE CHECK ----------
+    if (user.balance < amt) return res.status(400).json({ error: "Insufficient balance" });
+
+    const balance_before = user.balance;
+    const balance_after = +(balance_before - amt).toFixed(2);
+
+    // ---------- FRAUD RULES ----------
+    const fraudCheck = simpleFraudCheck({ amount: amt, balance_before });
+    if (fraudCheck.is_fraud) {
+      await Transaction.create({
+        txn_id: `UPI-${Date.now()}`,
+        user_id: user._id,
+        to_upi: upiId,
+        amount: amt,
+        balance_before,
+        balance_after: balance_before,
+        is_fraud: true,
+        fraud_reason: fraudCheck.reason
+      });
+
+      return res.json({
+        message: "UPI transaction flagged",
+        is_fraud: true,
+        txn_blocked: true,
+        fraud_reason: fraudCheck.reason
+      });
+    }
+
+    // ---------- DEBIT ----------
+    const txnId = `UPI-${Date.now()}`;
+    await Transaction.create({
+      txn_id: txnId,
+      user_id: user._id,
+      to_upi: upiId,
+      amount: amt,
+      balance_before,
+      balance_after,
+      is_fraud: false,
+      type: "DEBIT"
+    });
+
+    user.balance = balance_after;
+    user.transactionsCount += 1;
+    await user.save();
+
+    // ---------- CREDIT ----------
+    const r_before = receiver.balance;
+    const r_after = +(receiver.balance + amt).toFixed(2);
+
+    await Transaction.create({
+      txn_id: `${txnId}-CREDIT`,
+      user_id: receiver._id,
+      from_account: user.accountNumber,
+      to_upi: receiver.upiId,
+      amount: amt,
+      balance_before: r_before,
+      balance_after: r_after,
+      is_fraud: false,
+      type: "CREDIT"
+    });
+
+    receiver.balance = r_after;
+    receiver.transactionsCount += 1;
+    await receiver.save();
+
+    // ---------- SMS ----------
+    try {
+      await twilioClient.messages.create({
+        to: phoneToCheck,
+        body: `GramBank: ₹${amt} debited via UPI to ${upiId}. Avl bal ₹${balance_after}.`,
+        from: "+13326997688",
+      });
+
+      await twilioClient.messages.create({
+        to: formatPhone(receiver.phoneNumber),
+        body: `GramBank: ₹${amt} credited to your account via UPI from ${maskAccount(user.accountNumber)}. Avl bal ₹${r_after}.`,
+        from: "+13326997688",
+      });
+    } catch (e) {
+      console.error("SMS error:", e);
+    }
+
+    return res.json({
+      message: "UPI Transaction Successful",
+      txn_id: txnId,
+      balance_before,
+      balance_after,
+      receiver: receiver.upiId
+    });
+
+  } catch (err) {
+    console.error("UPI send error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 
 /* History, alerts, seed-fraud, balance, report routes — leave as before (no changes) */
 /* You already had these; re-add them unchanged below or keep existing ones in file. */
@@ -358,6 +480,8 @@ router.get("/balance", auth, async (req, res) => {
       name: user.name,
       aadhaarNumber: user.aadhaarNumber,
       balance: user.balance,
+      upiId: user.upiId,        // ⭐ Added
+      upiQR: user.upiQR,        // ⭐ Added
       recent: recentTxns.map((txn) => ({
         txn_id: txn.txn_id,
         amount: txn.amount,
@@ -370,6 +494,7 @@ router.get("/balance", auth, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch balance data" });
   }
 });
+
 
 router.post("/report", auth, async (req, res) => {
   try {
