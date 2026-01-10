@@ -279,7 +279,6 @@ router.post("/upi/send", auth, async (req, res) => {
 
     // ---------- FIND RECEIVER ----------
     const receiver = await User.findOne({ upiId });
-    if (!receiver) return res.status(404).json({ error: "Receiver UPI not found" });
 
     // ---------- BALANCE CHECK ----------
     if (user.balance < amt) return res.status(400).json({ error: "Insufficient balance" });
