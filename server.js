@@ -45,6 +45,9 @@ mongoose
 app.use("/api/users", userRoutes);
 app.use("/api/txns", txnRoutes);
 app.use("/api/otp", otpRoutes);
+app.use("/api/dashboard", require("./routes/dashboard.routes"));
+app.use("/api/fraud", require("./routes/fraudRoutes"));
+
 
 // ✅ Default route
 app.get("/", (req, res) => {

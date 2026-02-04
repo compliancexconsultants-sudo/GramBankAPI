@@ -143,3 +143,34 @@ router.post("/login", async (req, res) => {
 
 
 module.exports = router;
+
+// ==============================
+// ✅ ADMIN: GET ALL USERS
+// ==============================
+router.get("/admin/all-users", async (req, res) => {
+  try {
+    // Optional pagination
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const users = await User.find()
+      .select("-mpinHash -__v") // ❌ hide sensitive data
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    const totalUsers = await User.countDocuments();
+
+    res.status(200).json({
+      totalUsers,
+      currentPage: page,
+      totalPages: Math.ceil(totalUsers / limit),
+      users
+    });
+  } catch (error) {
+    console.error("Fetch Users Error:", error);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+

@@ -519,3 +519,35 @@ router.post("/report", auth, async (req, res) => {
 });
 
 module.exports = router;
+
+/**
+ * ==============================
+ * ✅ ADMIN: GET ALL TRANSACTIONS
+ * ==============================
+ * GET /api/txns/admin/all
+ */
+router.get("/admin/all", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const transactions = await Transaction.find()
+      .populate("user_id", "name accountNumber") // sender
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    const totalTransactions = await Transaction.countDocuments();
+
+    res.json({
+      totalTransactions,
+      currentPage: page,
+      totalPages: Math.ceil(totalTransactions / limit),
+      transactions
+    });
+  } catch (err) {
+    console.error("Admin fetch transactions error:", err);
+    res.status(500).json({ error: "Failed to fetch transactions" });
+  }
+});
