@@ -182,6 +182,7 @@ router.post("/send", auth, async (req, res) => {
       balance_before,
       balance_after,
       is_fraud: false,
+      type : 'DEBIT'
     });
     await txn.save();
 
