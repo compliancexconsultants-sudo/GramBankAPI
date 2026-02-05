@@ -66,7 +66,7 @@ router.post("/send-otp", auth, async (req, res) => {
       await twilioClient.messages.create({
         to: formattedPhone,
         body: `Your GramBank transaction OTP is ${code}. It will expire in 5 minutes.`,
-        from: '+13326997688',
+        from: '+17542900474',
       });
       return res.json({ message: "OTP sent successfully", otp: code });
     } catch (smsErr) {
@@ -111,7 +111,7 @@ router.post("/send", auth, async (req, res) => {
       try {
         const msg = `Alert: A transfer to account ${maskAccount(to_account)} has been blocked for safety. If this was not you, contact GramBank immediately.`;
         const sendMessage = await twilioClient.messages.create({
-          to: phoneToCheck, body: msg, from: '+13326997688',
+          to: phoneToCheck, body: msg, from: '+17542900474',
         });
       } catch (e) {
         console.error("Twilio alert error:", e);
@@ -153,7 +153,7 @@ router.post("/send", auth, async (req, res) => {
       try {
         const alertMsg = `⚠️ GramBank Alert: A ${fraudCheck.reason} transaction of ₹${amt.toFixed(2)} to ${maskAccount(to_account)} was flagged and blocked. Available balance: ₹${balance_before.toFixed(2)}.`;
         messageSended = await twilioClient.messages.create({
-          to: phoneToCheck, body: alertMsg, from: '+13326997688',
+          to: phoneToCheck, body: alertMsg, from: '+17542900474',
         });
       } catch (e) {
         console.error("Twilio alert error:", e);
@@ -223,7 +223,7 @@ router.post("/send", auth, async (req, res) => {
         await twilioClient.messages.create({
           to: phoneNumber,
           body: creditMsg,
-          from: "+13326997688",
+          from: "+17542900474",
         });
       } catch (e) {
         console.error("Receiver SMS error:", e);
@@ -235,7 +235,7 @@ router.post("/send", auth, async (req, res) => {
     try {
       const smsBody = `GramBank: Your A/c ${maskAccount(user.accountNumber || user._id)} debited ₹${amt.toFixed(2)} to ${beneficiary_name || maskAccount(to_account)} A/c ${maskAccount(to_account)}. Avl bal ₹${balance_after.toFixed(2)}. - GramBank`;
       messageBody = await twilioClient.messages.create({
-        to: phoneToCheck, body: smsBody, from: '+13326997688',
+        to: phoneToCheck, body: smsBody, from: '+17542900474',
       });
     } catch (smsErr) {
       console.error("Twilio debit SMS error:", smsErr);
@@ -318,46 +318,50 @@ router.post("/upi/send", auth, async (req, res) => {
       balance_before,
       balance_after,
       is_fraud: false,
-      type: "DEBIT"
+      type: "DEBIT",
     });
+
 
     user.balance = balance_after;
     user.transactionsCount += 1;
     await user.save();
 
     // ---------- CREDIT ----------
-    const r_before = receiver.balance;
-    const r_after = +(receiver.balance + amt).toFixed(2);
+    if (receiver) {
+      const r_before = receiver.balance;
+      const r_after = +(receiver.balance + amt).toFixed(2);
 
-    await Transaction.create({
-      txn_id: `${txnId}-CREDIT`,
-      user_id: receiver._id,
-      from_account: user.accountNumber,
-      to_upi: receiver.upiId,
-      amount: amt,
-      balance_before: r_before,
-      balance_after: r_after,
-      is_fraud: false,
-      type: "CREDIT"
-    });
+      await Transaction.create({
+        txn_id: `${txnId}-CREDIT`,
+        user_id: receiver._id,
+        from_account: user.accountNumber,
+        to_upi: receiver.upiId,
+        amount: amt,
+        balance_before: r_before,
+        balance_after: r_after,
+        is_fraud: false,
+        type: "CREDIT",
+      });
 
-    receiver.balance = r_after;
-    receiver.transactionsCount += 1;
-    await receiver.save();
 
+      receiver.balance = r_after;
+      receiver.transactionsCount += 1;
+      await receiver.save();
+    }
     // ---------- SMS ----------
     try {
       await twilioClient.messages.create({
         to: phoneToCheck,
         body: `GramBank: ₹${amt} debited via UPI to ${upiId}. Avl bal ₹${balance_after}.`,
-        from: "+13326997688",
+        from: "+17542900474",
       });
-
-      await twilioClient.messages.create({
-        to: formatPhone(receiver.phoneNumber),
-        body: `GramBank: ₹${amt} credited to your account via UPI from ${maskAccount(user.accountNumber)}. Avl bal ₹${r_after}.`,
-        from: "+13326997688",
-      });
+      if (receiver) {
+        await twilioClient.messages.create({
+          to: formatPhone(receiver.phoneNumber),
+          body: `GramBank: ₹${amt} credited to your account via UPI from ${maskAccount(user.accountNumber)}. Avl bal ₹${r_after}.`,
+          from: "+17542900474",
+        });
+      }
     } catch (e) {
       console.error("SMS error:", e);
     }
@@ -367,7 +371,7 @@ router.post("/upi/send", auth, async (req, res) => {
       txn_id: txnId,
       balance_before,
       balance_after,
-      receiver: receiver.upiId
+      receiver: upiId
     });
 
   } catch (err) {

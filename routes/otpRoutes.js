@@ -24,7 +24,7 @@ router.post("/send", async (req, res) => {
         // Send OTP SMS
         const message = await client.messages.create({
             body: `Your GramBank OTP is ${otp}. It expires in 5 minutes.`,
-            from: '+13326997688',
+            from: '+17542900474',
             to: formattedPhone,
         });
 
