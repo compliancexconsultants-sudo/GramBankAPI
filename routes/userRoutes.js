@@ -173,4 +173,92 @@ router.get("/admin/all-users", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch users" });
   }
 });
+// ==============================
+// ✅ ADMIN: FREEZE USER ACCOUNT
+// ==============================
+router.post("/admin/freeze/:userId", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    user.status = "FROZEN";
+    await user.save();
+
+    res.json({
+      message: "User account frozen successfully",
+      userId: user._id,
+      status: user.status
+    });
+  } catch (err) {
+    console.error("Freeze error:", err);
+    res.status(500).json({ error: "Failed to freeze account" });
+  }
+});
+
+// ==============================
+// ✅ ADMIN: UNFREEZE USER ACCOUNT
+// ==============================
+router.post("/admin/unfreeze/:userId", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    user.status = "ACTIVE";
+    await user.save();
+
+    res.json({
+      message: "User account unfrozen successfully",
+      userId: user._id,
+      status: user.status
+    });
+  } catch (err) {
+    console.error("Unfreeze error:", err);
+    res.status(500).json({ error: "Failed to unfreeze account" });
+  }
+});
+// ==============================
+// ✅ ADMIN: ADD BALANCE TO USER
+// ==============================
+router.post("/admin/add-balance", async (req, res) => {
+  try {
+    const { userId, amount, reason } = req.body;
+
+    if (!userId || !amount || amount <= 0) {
+      return res.status(400).json({ error: "Invalid request" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const before = user.balance;
+    user.balance += Number(amount);
+    user.transactionsCount += 1;
+    await user.save();
+
+    // Optional: record as CREDIT transaction
+    const Transaction = require("../models/Transaction");
+
+    await Transaction.create({
+      txn_id: `ADMIN-${Date.now()}`,
+      user_id: user._id,
+      amount,
+      balance_before: before,
+      balance_after: user.balance,
+      type: "CREDIT",
+      is_fraud: false,
+      note: reason || "Admin credit"
+    });
+
+    res.json({
+      message: "Amount added successfully",
+      balance_before: before,
+      balance_after: user.balance
+    });
+  } catch (err) {
+    console.error("Add balance error:", err);
+    res.status(500).json({ error: "Failed to add balance" });
+  }
+});
 

@@ -556,3 +556,37 @@ router.get("/admin/all", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch transactions" });
   }
 });
+/**
+ * ==============================
+ * ✅ ADMIN: USER BASED TRANSACTIONS
+ * ==============================
+ * GET /api/txns/admin/user/:userId
+ */
+router.get("/admin/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const transactions = await Transaction.find({ user_id: userId })
+      .populate("user_id", "name accountNumber upiId")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    const total = await Transaction.countDocuments({ user_id: userId });
+
+    res.json({
+      userId,
+      totalTransactions: total,
+      currentPage: page,
+      totalPages: Math.ceil(total / limit),
+      transactions,
+    });
+  } catch (err) {
+    console.error("User based txn error:", err);
+    res.status(500).json({ error: "Failed to fetch user transactions" });
+  }
+});

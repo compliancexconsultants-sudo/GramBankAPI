@@ -4,17 +4,17 @@ const mongoose = require("mongoose");
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
 
-  aadhaarNumber: { 
-    type: String, 
-    required: true, 
+  aadhaarNumber: {
+    type: String,
+    required: true,
     unique: true,
-    match: /^\d{12}$/ 
+    match: /^\d{12}$/
   },
 
-  panNumber: { 
-    type: String, 
-    required: true, 
-    match: /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/ 
+  panNumber: {
+    type: String,
+    required: true,
+    match: /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/
   },
 
   mpinHash: { type: String, required: true },
@@ -28,23 +28,28 @@ const userSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  status: {
+    type: String,
+    enum: ["ACTIVE", "FROZEN"],
+    default: "ACTIVE"
+  },
 
-  phoneNumber: { 
-    type: String, 
+  phoneNumber: {
+    type: String,
     required: true,
     unique: true,
-    match: /^[6-9]\d{9}$/ 
+    match: /^[6-9]\d{9}$/
   },
 
   // ⭐ NEW FIELDS
-  upiId: { 
-    type: String, 
+  upiId: {
+    type: String,
     required: true,
-    unique: true 
+    unique: true
   },
 
-  upiQR: { 
-    type: String, 
+  upiQR: {
+    type: String,
     required: true // IMGBB hosted QR URL
   }
 });
