@@ -3,7 +3,8 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const Transaction = require("../models/Transaction");
 const User = require("../models/User");
-const Otp = require("../models/Otp"); // new: OTP model
+const Otp = require("../models/Otp");
+const ScheduledTransaction = require("../models/ScheduledTransaction");
 const auth = require("../middleware/auth");
 const router = express.Router();
 const FraudAccount = require("../models/FraudAccount");
@@ -11,6 +12,91 @@ const accountSid = process.env.TWILIO_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const messagingServiceSid = process.env.TWILIO_MSG_SID;
 const twilioClient = require("twilio")(accountSid, authToken);
+
+// ---- Constants for fraud detection ----
+const HIGH_VALUE_THRESHOLD = 10000;
+const DELAY_DURATION_MS = 60 * 60 * 1000; // 1 hour
+const RAPID_SEQUENCE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_TXNS_IN_WINDOW = 3;
+const RAPID_SEQUENCE_AMOUNT_THRESHOLD = 5000;
+const SUSPICIOUS_MULTI_ACCOUNT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_UNIQUE_ACCOUNTS = 2;
+
+// ---- Helper: Advanced fraud detection rules ----
+async function advancedFraudCheck(userId, amount, toAccount) {
+  const suspiciousFlags = [];
+  let riskScore = 0;
+
+  // Get recent transactions for pattern analysis
+  const recentTxns = await Transaction.find({
+    user_id: userId,
+    createdAt: { $gte: new Date(Date.now() - SUSPICIOUS_MULTI_ACCOUNT_WINDOW_MS) }
+  }).sort({ createdAt: -1 });
+
+  // Rule 1: Rapid Sequence Detection
+  // Fraudsters transfer money through multiple accounts quickly
+  const recentDebits = recentTxns.filter(t => t.type === 'DEBIT' && !t.is_fraud);
+  const rapidSequenceTxns = recentDebits.filter(t => 
+    (Date.now() - new Date(t.createdAt).getTime()) < RAPID_SEQUENCE_WINDOW_MS
+  );
+
+  if (rapidSequenceTxns.length >= MAX_TXNS_IN_WINDOW) {
+    const uniqueAccounts = new Set(
+      rapidSequenceTxns
+        .filter(t => t.to_account)
+        .map(t => t.to_account)
+    );
+    
+    if (uniqueAccounts.size >= MAX_UNIQUE_ACCOUNTS) {
+      suspiciousFlags.push('RAPID_SEQUENCE_MULTI_ACCOUNT');
+      riskScore += 40;
+    }
+  }
+
+  // Rule 2: Rapid sequence detected (fast consecutive transactions)
+  if (recentDebits.length > 0) {
+    const lastTxn = recentDebits[0];
+    const timeSinceLastTxn = (Date.now() - new Date(lastTxn.createdAt).getTime()) / 1000;
+    
+    if (timeSinceLastTxn < 60 && lastTxn.amount >= RAPID_SEQUENCE_AMOUNT_THRESHOLD) {
+      suspiciousFlags.push('RAPID_CONSECUTIVE_TRANSACTION');
+      riskScore += 30;
+    }
+  }
+
+  // Rule 3: High value transaction delay trigger
+  if (amount > HIGH_VALUE_THRESHOLD) {
+    riskScore += 20;
+    suspiciousFlags.push('HIGH_VALUE_TRANSACTION');
+  }
+
+  // Rule 4: Pattern matching - multiple accounts in short time
+  const accountsInWindow = recentTxns
+    .filter(t => t.to_account && (Date.now() - new Date(t.createdAt).getTime()) < SUSPICIOUS_MULTI_ACCOUNT_WINDOW_MS)
+    .map(t => t.to_account);
+  
+  const uniqueAccountsCount = new Set(accountsInWindow).size;
+  if (uniqueAccountsCount >= MAX_UNIQUE_ACCOUNTS && toAccount && !accountsInWindow.includes(toAccount)) {
+    suspiciousFlags.push('NEW_ACCOUNT_AFTER_MULTI_ACCOUNT_PATTERN');
+    riskScore += 25;
+  }
+
+  // Rule 5: Structuring detection (transactions just below threshold)
+  const nearThresholdTxns = recentTxns.filter(t => 
+    t.amount >= HIGH_VALUE_THRESHOLD * 0.9 && t.amount < HIGH_VALUE_THRESHOLD
+  );
+  if (nearThresholdTxns.length >= 2) {
+    suspiciousFlags.push('POTENTIAL_STRUCTURING');
+    riskScore += 35;
+  }
+
+  return {
+    isSuspicious: suspiciousFlags.length > 0,
+    suspiciousFlags,
+    riskScore,
+    needsDelay: amount > HIGH_VALUE_THRESHOLD || suspiciousFlags.length > 0
+  };
+}
 
 // ---- Helper: simple fraud rules ----
 function simpleFraudCheck({ amount, balance_before, location_delta_km, is_foreign_device, txns_last_24h }) {
@@ -130,6 +216,66 @@ router.post("/send", auth, async (req, res) => {
     // ---- Check sufficient balance ----
     if (user.balance < amt) return res.status(400).json({ error: "Insufficient balance" });
 
+    // ---- Advanced Fraud Detection ----
+    const fraudAnalysis = await advancedFraudCheck(user._id, amt, to_account);
+    
+    // Check if last transaction was rapid
+    const lastTxn = await Transaction.findOne({ user_id: user._id, type: 'DEBIT' }).sort({ createdAt: -1 });
+    let timeSinceLastTxn = null;
+    if (lastTxn) {
+      timeSinceLastTxn = (Date.now() - new Date(lastTxn.createdAt).getTime()) / 1000;
+    }
+
+    // ---- Check sufficient balance for scheduled transaction ----
+    if (fraudAnalysis.needsDelay) {
+      const scheduled_at = new Date(Date.now() + DELAY_DURATION_MS);
+      
+      const scheduledTxn = new ScheduledTransaction({
+        user_id: user._id,
+        txn_id: `SCHED-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        to_account,
+        ifsc,
+        beneficiary_name,
+        amount: amt,
+        balance_before: user.balance,
+        balance_after: +(user.balance - amt).toFixed(2),
+        type: 'DEBIT',
+        status: 'PENDING',
+        scheduled_at,
+        delay_reason: fraudAnalysis.suspiciousFlags.length > 0 
+          ? `Fraud pattern detected: ${fraudAnalysis.suspiciousFlags.join(', ')}`
+          : 'High value transaction (above ₹10,000)',
+        fraud_check_passed: !fraudAnalysis.isSuspicious
+      });
+      
+      await scheduledTxn.save();
+
+      // Send alert SMS about delayed transaction
+      try {
+        const alertMsg = `⚠️ GramBank Alert: Your transaction of ₹${amt} to ${beneficiary_name || maskAccount(to_account)} has been scheduled for review. Processing will complete after ${scheduled_at.toLocaleTimeString()}. This is a security measure for high-value transactions.`;
+        await twilioClient.messages.create({
+          to: phoneToCheck, body: alertMsg, from: '+17542900474',
+        });
+      } catch (e) {
+        console.error("Alert SMS error:", e);
+      }
+
+      return res.json({
+        message: "Transaction scheduled for delayed processing",
+        is_scheduled: true,
+        scheduled_at: scheduled_at,
+        delay_reason: fraudAnalysis.suspiciousFlags.length > 0 
+          ? `Security delay: ${fraudAnalysis.suspiciousFlags.join(', ')}`
+          : "High value transaction requires verification",
+        txn_id: scheduledTxn.txn_id,
+        amount: amt,
+        beneficiary: beneficiary_name || maskAccount(to_account),
+        is_suspicious: fraudAnalysis.isSuspicious,
+        risk_score: fraudAnalysis.riskScore,
+        fraud_flags: fraudAnalysis.suspiciousFlags
+      });
+    }
+
     // ---- Basic fraud rules (extendable) ----
     const balance_before = user.balance;
     const fraudCheck = simpleFraudCheck({ amount: amt, balance_before });
@@ -146,6 +292,11 @@ router.post("/send", auth, async (req, res) => {
         balance_after: balance_before, // no deduction if blocked
         is_fraud: true,
         fraud_reason: fraudCheck.reason,
+        is_suspicious: true,
+        suspicious_flags: ['FRAUD_RULE_VIOLATION'],
+        risk_score: 100,
+        time_since_last_txn_seconds: timeSinceLastTxn,
+        rapid_sequence_detected: fraudAnalysis.isSuspicious
       });
       await flaggedTxn.save();
       let messageSended
@@ -284,10 +435,67 @@ router.post("/upi/send", auth, async (req, res) => {
     // ---------- BALANCE CHECK ----------
     if (user.balance < amt) return res.status(400).json({ error: "Insufficient balance" });
 
+    // ---------- ADVANCED FRAUD CHECK FOR UPI ----------
+    const fraudAnalysis = await advancedFraudCheck(user._id, amt, null);
+
+    // Check if last transaction was rapid
+    const lastTxn = await Transaction.findOne({ user_id: user._id, type: 'DEBIT' }).sort({ createdAt: -1 });
+    let timeSinceLastTxn = null;
+    if (lastTxn) {
+      timeSinceLastTxn = (Date.now() - new Date(lastTxn.createdAt).getTime()) / 1000;
+    }
+
+    // ---------- HIGH VALUE/SUSPICIOUS DELAY ----------
+    if (fraudAnalysis.needsDelay) {
+      const scheduled_at = new Date(Date.now() + DELAY_DURATION_MS);
+
+      const scheduledTxn = new ScheduledTransaction({
+        user_id: user._id,
+        txn_id: `UPI-SCHED-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        to_upi: upiId,
+        amount: amt,
+        balance_before: user.balance,
+        balance_after: +(user.balance - amt).toFixed(2),
+        type: 'DEBIT',
+        status: 'PENDING',
+        scheduled_at,
+        delay_reason: fraudAnalysis.suspiciousFlags.length > 0
+          ? `Fraud pattern detected: ${fraudAnalysis.suspiciousFlags.join(', ')}`
+          : 'High value transaction (above ₹10,000)',
+        fraud_check_passed: !fraudAnalysis.isSuspicious
+      });
+
+      await scheduledTxn.save();
+
+      try {
+        const alertMsg = `⚠️ GramBank Alert: Your UPI payment of ₹${amt} to ${upiId} has been scheduled for review. Processing will complete after ${scheduled_at.toLocaleTimeString()}.`;
+        await twilioClient.messages.create({
+          to: phoneToCheck, body: alertMsg, from: '+17542900474',
+        });
+      } catch (e) {
+        console.error("Alert SMS error:", e);
+      }
+
+      return res.json({
+        message: "UPI transaction scheduled for delayed processing",
+        is_scheduled: true,
+        scheduled_at: scheduled_at,
+        delay_reason: fraudAnalysis.suspiciousFlags.length > 0
+          ? `Security delay: ${fraudAnalysis.suspiciousFlags.join(', ')}`
+          : "High value UPI transaction requires verification",
+        txn_id: scheduledTxn.txn_id,
+        amount: amt,
+        receiver: upiId,
+        is_suspicious: fraudAnalysis.isSuspicious,
+        risk_score: fraudAnalysis.riskScore,
+        fraud_flags: fraudAnalysis.suspiciousFlags
+      });
+    }
+
     const balance_before = user.balance;
     const balance_after = +(balance_before - amt).toFixed(2);
 
-    // ---------- FRAUD RULES ----------
+    // ---------- SIMPLE FRAUD RULES ----------
     const fraudCheck = simpleFraudCheck({ amount: amt, balance_before });
     if (fraudCheck.is_fraud) {
       await Transaction.create({
@@ -298,7 +506,12 @@ router.post("/upi/send", auth, async (req, res) => {
         balance_before,
         balance_after: balance_before,
         is_fraud: true,
-        fraud_reason: fraudCheck.reason
+        fraud_reason: fraudCheck.reason,
+        is_suspicious: true,
+        suspicious_flags: ['FRAUD_RULE_VIOLATION'],
+        risk_score: 100,
+        time_since_last_txn_seconds: timeSinceLastTxn,
+        rapid_sequence_detected: fraudAnalysis.isSuspicious
       });
 
       return res.json({
@@ -320,6 +533,11 @@ router.post("/upi/send", auth, async (req, res) => {
       balance_after,
       is_fraud: false,
       type: "DEBIT",
+      is_suspicious: fraudAnalysis.isSuspicious,
+      suspicious_flags: fraudAnalysis.suspiciousFlags,
+      risk_score: fraudAnalysis.riskScore,
+      time_since_last_txn_seconds: timeSinceLastTxn,
+      rapid_sequence_detected: fraudAnalysis.suspiciousFlags.includes('RAPID_SEQUENCE_MULTI_ACCOUNT')
     });
 
 
@@ -519,6 +737,185 @@ router.post("/report", auth, async (req, res) => {
     res.json({ message: "Fraudulent account reported successfully" });
   } catch (err) {
     console.error("Fraud report error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * GET /api/txns/scheduled
+ * Get user's pending scheduled transactions
+ */
+router.get("/scheduled", auth, async (req, res) => {
+  try {
+    const user = req.user;
+    const pendingTxns = await ScheduledTransaction.find({
+      user_id: user._id,
+      status: 'PENDING'
+    }).sort({ scheduled_at: 1 });
+
+    res.json({
+      count: pendingTxns.length,
+      transactions: pendingTxns.map(t => ({
+        txn_id: t.txn_id,
+        amount: t.amount,
+        to_account: maskAccount(t.to_account),
+        beneficiary_name: t.beneficiary_name,
+        scheduled_at: t.scheduled_at,
+        delay_reason: t.delay_reason,
+        status: t.status
+      }))
+    });
+  } catch (err) {
+    console.error("Scheduled txns error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * DELETE /api/txns/scheduled/:txnId
+ * Cancel a pending scheduled transaction
+ */
+router.delete("/scheduled/:txnId", auth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { txnId } = req.params;
+
+    const scheduledTxn = await ScheduledTransaction.findOne({
+      txn_id: txnId,
+      user_id: user._id,
+      status: 'PENDING'
+    });
+
+    if (!scheduledTxn) {
+      return res.status(404).json({ error: "Scheduled transaction not found or already processed" });
+    }
+
+    if (new Date() >= scheduledTxn.scheduled_at) {
+      return res.status(400).json({ error: "Cannot cancel - transaction is being processed" });
+    }
+
+    scheduledTxn.status = 'CANCELLED';
+    await scheduledTxn.save();
+
+    res.json({
+      message: "Transaction cancelled successfully",
+      txn_id: scheduledTxn.txn_id,
+      refund: scheduledTxn.amount
+    });
+  } catch (err) {
+    console.error("Cancel scheduled txn error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * POST /api/txns/process-scheduled
+ * Background job to process scheduled transactions (called by cron/scheduler)
+ */
+router.post("/process-scheduled", async (req, res) => {
+  try {
+    const now = new Date();
+    const pendingTxns = await ScheduledTransaction.find({
+      status: 'PENDING',
+      scheduled_at: { $lte: now }
+    }).populate('user_id');
+
+    let processed = 0;
+    let failed = 0;
+
+    for (const schedTxn of pendingTxns) {
+      try {
+        schedTxn.status = 'PROCESSING';
+        await schedTxn.save();
+
+        const user = schedTxn.user_id;
+
+        if (user.balance < schedTxn.amount) {
+          schedTxn.status = 'FAILED';
+          schedTxn.processed_at = now;
+          await schedTxn.save();
+          failed++;
+          continue;
+        }
+
+        const balance_before = user.balance;
+        const balance_after = +(balance_before - schedTxn.amount).toFixed(2);
+
+        user.balance = balance_after;
+        user.transactionsCount = (user.transactionsCount || 0) + 1;
+        await user.save();
+
+        const txn = new Transaction({
+          txn_id: schedTxn.txn_id,
+          user_id: user._id,
+          to_account: schedTxn.to_account,
+          ifsc: schedTxn.ifsc,
+          beneficiary_name: schedTxn.beneficiary_name,
+          amount: schedTxn.amount,
+          balance_before,
+          balance_after,
+          type: 'DEBIT',
+          is_fraud: false,
+          is_suspicious: !schedTxn.fraud_check_passed,
+          suspicious_flags: schedTxn.fraud_check_passed ? [] : [schedTxn.delay_reason],
+          risk_score: schedTxn.fraud_check_passed ? 0 : 50,
+          createdAt: now
+        });
+        await txn.save();
+
+        const receiver = await User.findOne({ accountNumber: schedTxn.to_account });
+        if (receiver) {
+          const r_before = receiver.balance;
+          const r_after = +(receiver.balance + schedTxn.amount).toFixed(2);
+
+          await Transaction.create({
+            txn_id: `${schedTxn.txn_id}-CREDIT`,
+            user_id: receiver._id,
+            from_account: user.accountNumber,
+            to_account: receiver.accountNumber,
+            amount: schedTxn.amount,
+            balance_before: r_before,
+            balance_after: r_after,
+            type: 'CREDIT',
+            is_fraud: false
+          });
+
+          receiver.balance = r_after;
+          receiver.transactionsCount += 1;
+          await receiver.save();
+        }
+
+        try {
+          await twilioClient.messages.create({
+            to: formatPhone(user.phoneNumber),
+            body: `GramBank: ₹${schedTxn.amount} transferred to ${schedTxn.beneficiary_name || maskAccount(schedTxn.to_account)}. Avl bal ₹${balance_after}.`,
+            from: '+17542900474',
+          });
+        } catch (e) {
+          console.error("SMS error:", e);
+        }
+
+        schedTxn.status = 'COMPLETED';
+        schedTxn.processed_at = now;
+        await schedTxn.save();
+        processed++;
+      } catch (err) {
+        console.error(`Processing scheduled txn error: ${schedTxn.txn_id}`, err);
+        schedTxn.status = 'FAILED';
+        schedTxn.processed_at = now;
+        await schedTxn.save();
+        failed++;
+      }
+    }
+
+    res.json({
+      message: "Processing complete",
+      processed,
+      failed,
+      total: pendingTxns.length
+    });
+  } catch (err) {
+    console.error("Process scheduled error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });

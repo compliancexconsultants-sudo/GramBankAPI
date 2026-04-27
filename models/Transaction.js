@@ -9,20 +9,17 @@ const txnSchema = new mongoose.Schema({
     required: true,
   },
 
-  // ---- DESTINATION ----
-  to_account: { type: String },        // bank account
-  to_upi: { type: String },            // UPI ID
+  to_account: { type: String },
+  to_upi: { type: String },
   from_account: { type: String },
 
   ifsc: { type: String },
   beneficiary_name: { type: String },
 
-  // ---- MONEY ----
   amount: { type: Number, required: true },
   balance_before: { type: Number, required: true },
   balance_after: { type: Number, required: true },
 
-  // ---- META ----
   type: { type: String, enum: ["DEBIT", "CREDIT"], required: true },
 
   hour: Number,
@@ -32,9 +29,15 @@ const txnSchema = new mongoose.Schema({
   location_delta_km: Number,
   is_foreign_device: { type: Number, default: 0 },
 
-  // ---- FRAUD ----
   is_fraud: { type: Boolean, default: false },
   fraud_reason: { type: String, default: null },
+
+  is_suspicious: { type: Boolean, default: false },
+  suspicious_flags: [{ type: String }],
+  risk_score: { type: Number, default: 0 },
+
+  time_since_last_txn_seconds: { type: Number, default: null },
+  rapid_sequence_detected: { type: Boolean, default: false },
 
   createdAt: { type: Date, default: Date.now },
 });

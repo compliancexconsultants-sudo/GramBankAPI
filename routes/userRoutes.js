@@ -103,6 +103,9 @@ router.post("/login", async (req, res) => {
   try {
     const aadhaarNumber = req.body.aadhaarNumber?.toString().trim();
     const mpin = req.body.mpin?.trim();
+    const deviceId = req.body.deviceId || "unknown-device";
+    const deviceName = req.body.deviceName || "Unknown Device";
+    const ipAddress = req.headers["x-forwarded-for"] || req.connection?.remoteAddress || "unknown";
 
     if (!aadhaarNumber || !mpin)
       return res.status(400).json({ error: "Aadhaar number and MPIN required" });
@@ -112,10 +115,67 @@ router.post("/login", async (req, res) => {
     if (!user)
       return res.status(404).json({ error: "User not found" });
 
+    // Check account status
+    if (user.status === "FROZEN")
+      return res.status(403).json({ error: "Account is frozen. Contact support." });
+
     // Verify MPIN
     const isMatch = await bcrypt.compare(mpin, user.mpinHash);
     if (!isMatch)
       return res.status(401).json({ error: "Invalid MPIN" });
+
+    // Check cooling period for new device
+    const isNewDevice = !user.deviceId || user.deviceId !== deviceId;
+    
+    if (isNewDevice && user.newDeviceCoolDownUntil) {
+      const now = new Date();
+      if (new Date(user.newDeviceCoolDownUntil) > now) {
+        const remainingMinutes = Math.ceil((new Date(user.newDeviceCoolDownUntil) - now) / 60000);
+        return res.status(403).json({
+          error: "NEW_DEVICE_COOLDOWN",
+          message: "Please wait before logging in from a new device",
+          cooldown_remaining_seconds: Math.floor((new Date(user.newDeviceCoolDownUntil) - now) / 1000),
+          cooldown_remaining_minutes: remainingMinutes,
+          retry_after: user.newDeviceCoolDownUntil
+        });
+      }
+    }
+
+    // Update device tracking
+    const now = new Date();
+    const COOLDOWN_HOURS = 1;
+    const cooldownUntil = new Date(now.getTime() + COOLDOWN_HOURS * 60 * 60 * 1000);
+
+    if (isNewDevice) {
+      // Check if device exists in history
+      const existingDeviceIndex = user.deviceHistory?.findIndex(d => d.deviceId === deviceId);
+      
+      if (existingDeviceIndex >= 0) {
+        // Update existing device
+        user.deviceHistory[existingDeviceIndex].lastLoginAt = now;
+        user.deviceHistory[existingDeviceIndex].ipAddress = ipAddress;
+      } else {
+        // New device - add to history and set cooldown
+        user.deviceHistory = user.deviceHistory || [];
+        user.deviceHistory.push({
+          deviceId,
+          deviceName,
+          firstLoginAt: now,
+          lastLoginAt: now,
+          ipAddress
+        });
+        user.newDeviceCoolDownUntil = cooldownUntil;
+      }
+      user.lastLoginDevice = deviceName;
+    }
+
+    // Update last login info
+    user.lastLoginTime = now;
+    user.lastLoginIP = ipAddress;
+    if (isNewDevice) {
+      user.deviceId = deviceId;
+    }
+    await user.save();
 
     // Generate JWT
     const token = jwt.sign(
@@ -127,6 +187,8 @@ router.post("/login", async (req, res) => {
     res.status(200).json({
       message: "✅ Login successful",
       token,
+      isNewDevice,
+      cooldown_applied: isNewDevice && !user.deviceHistory?.find(d => d.deviceId === deviceId),
       user: {
         id: user._id,
         name: user.name,
@@ -259,6 +321,46 @@ router.post("/admin/add-balance", async (req, res) => {
   } catch (err) {
     console.error("Add balance error:", err);
     res.status(500).json({ error: "Failed to add balance" });
+  }
+});
+
+// ==============================
+// ✅ ADMIN: BYPASS DEVICE COOLDOWN
+// ==============================
+router.post("/admin/bypass-cooldown/:userId", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    user.newDeviceCoolDownUntil = null;
+    await user.save();
+
+    res.json({ message: "Device cooldown bypassed", userId: user._id });
+  } catch (err) {
+    console.error("Bypass cooldown error:", err);
+    res.status(500).json({ error: "Failed to bypass cooldown" });
+  }
+});
+
+// ==============================
+// ✅ ADMIN: GET USER DEVICE HISTORY
+// ==============================
+router.get("/admin/device-history/:userId", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    res.json({
+      deviceId: user.deviceId,
+      deviceHistory: user.deviceHistory || [],
+      lastLoginDevice: user.lastLoginDevice,
+      lastLoginTime: user.lastLoginTime,
+      lastLoginIP: user.lastLoginIP,
+      newDeviceCoolDownUntil: user.newDeviceCoolDownUntil
+    });
+  } catch (err) {
+    console.error("Device history error:", err);
+    res.status(500).json({ error: "Failed to get device history" });
   }
 });
 

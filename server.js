@@ -12,7 +12,7 @@ const app = express();
 // ✅ Universal CORS Setup (Compatible with Express 5)
 app.use(
   cors({
-    origin: "*", // Allow all origins
+    origin: "*", 
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -34,7 +34,6 @@ app.use((req, res, next) => {
 app.use(bodyParser.json());
 app.use(express.json());
 
-
 // ✅ MongoDB connection
 mongoose
   .connect(process.env.MONGO_URI)
@@ -47,7 +46,11 @@ app.use("/api/txns", txnRoutes);
 app.use("/api/otp", otpRoutes);
 app.use("/api/dashboard", require("./routes/dashboard.routes"));
 app.use("/api/fraud", require("./routes/fraudRoutes"));
-
+app.use("/api/reports", require("./routes/reportRoutes"));
+app.use("/api/chatbot", require("./routes/chatbotRoutes"));
+app.use("/api/live-chat", require("./routes/liveChatRoutes"));
+app.use("/api/admin", require("./routes/adminRoutes"));
+app.use("/api/upi-collect", require("./routes/upiCollectRoutes"));
 
 // ✅ Default route
 app.get("/", (req, res) => {
