@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const QRCode = require("qrcode");
 const axios = require("axios");
 const User = require("../models/User");
+const Transaction = require("../models/Transaction");
 const qs = require("qs");
 
 const router = express.Router();
@@ -45,32 +46,26 @@ router.post("/signup", async (req, res) => {
       if (!existingAcc) isUnique = true;
     }
 
-    // ---------- CREATE UPI ----------
     const upiId = `${accountNumber}@grambank`;
+    const upiString = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(name)}&cu=INR`;
 
-    const upiString = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(
-      name
-    )}&cu=INR`;
-
-    // ---------- GENERATE QR (Base64 Data URL) ----------
     const qrDataUrl = await QRCode.toDataURL(upiString);
-    const base64Image = qrDataUrl.split(",")[1]; // remove data:image/png;base64,
+    const base64Image = qrDataUrl.split(",")[1];
 
-    // ---------- UPLOAD TO IMGBB ----------
-    const uploadRes = await axios.post(
-      `https://api.imgbb.com/1/upload`,
-      qs.stringify({
-        key: process.env.IMGBB_API_KEY,
-        image: base64Image
-      }),
-      {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    let qrImageUrl = "";
+    if (process.env.IMGBB_API_KEY) {
+      try {
+        const uploadRes = await axios.post(
+          `https://api.imgbb.com/1/upload`,
+          qs.stringify({ key: process.env.IMGBB_API_KEY, image: base64Image }),
+          { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+        );
+        qrImageUrl = uploadRes.data.data?.url || "";
+      } catch (imgErr) {
+        qrImageUrl = "";
       }
-    );
+    }
 
-    const qrImageUrl = uploadRes.data.data.url;
-
-    // ---------- SAVE USER ----------
     const newUser = await User.create({
       name,
       aadhaarNumber,
@@ -83,141 +78,75 @@ router.post("/signup", async (req, res) => {
     });
 
     res.status(201).json({
-      message: "✅ User registered successfully",
+      message: "User registered successfully",
       userId: newUser._id,
       accountNumber: newUser.accountNumber,
       upiId: newUser.upiId,
-      upiQR: newUser.upiQR   // IMGBB hosted URL
+      upiQR: newUser.upiQR
     });
-
   } catch (error) {
-    console.error("Signup Error:", error?.response?.data || error);
+    console.error("Signup Error:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-
-
-// ✅ Login Route with JWT
 router.post("/login", async (req, res) => {
   try {
-    const aadhaarNumber = req.body.aadhaarNumber?.toString().trim();
-    const mpin = req.body.mpin?.trim();
-    const deviceId = req.body.deviceId || "unknown-device";
-    const deviceName = req.body.deviceName || "Unknown Device";
-    const ipAddress = req.headers["x-forwarded-for"] || req.connection?.remoteAddress || "unknown";
+    const { aadhaarNumber, mpin } = req.body;
+
 
     if (!aadhaarNumber || !mpin)
       return res.status(400).json({ error: "Aadhaar number and MPIN required" });
 
-    // Find user safely
     const user = await User.findOne({ aadhaarNumber });
+
     if (!user)
       return res.status(404).json({ error: "User not found" });
 
-    // Check account status
     if (user.status === "FROZEN")
       return res.status(403).json({ error: "Account is frozen. Contact support." });
 
-    // Verify MPIN
     const isMatch = await bcrypt.compare(mpin, user.mpinHash);
     if (!isMatch)
       return res.status(401).json({ error: "Invalid MPIN" });
 
-    // Check cooling period for new device
-    const isNewDevice = !user.deviceId || user.deviceId !== deviceId;
-    
-    if (isNewDevice && user.newDeviceCoolDownUntil) {
-      const now = new Date();
-      if (new Date(user.newDeviceCoolDownUntil) > now) {
-        const remainingMinutes = Math.ceil((new Date(user.newDeviceCoolDownUntil) - now) / 60000);
-        return res.status(403).json({
-          error: "NEW_DEVICE_COOLDOWN",
-          message: "Please wait before logging in from a new device",
-          cooldown_remaining_seconds: Math.floor((new Date(user.newDeviceCoolDownUntil) - now) / 1000),
-          cooldown_remaining_minutes: remainingMinutes,
-          retry_after: user.newDeviceCoolDownUntil
-        });
-      }
-    }
-
-    // Update device tracking
-    const now = new Date();
-    const COOLDOWN_HOURS = 1;
-    const cooldownUntil = new Date(now.getTime() + COOLDOWN_HOURS * 60 * 60 * 1000);
-
-    if (isNewDevice) {
-      // Check if device exists in history
-      const existingDeviceIndex = user.deviceHistory?.findIndex(d => d.deviceId === deviceId);
-      
-      if (existingDeviceIndex >= 0) {
-        // Update existing device
-        user.deviceHistory[existingDeviceIndex].lastLoginAt = now;
-        user.deviceHistory[existingDeviceIndex].ipAddress = ipAddress;
-      } else {
-        // New device - add to history and set cooldown
-        user.deviceHistory = user.deviceHistory || [];
-        user.deviceHistory.push({
-          deviceId,
-          deviceName,
-          firstLoginAt: now,
-          lastLoginAt: now,
-          ipAddress
-        });
-        user.newDeviceCoolDownUntil = cooldownUntil;
-      }
-      user.lastLoginDevice = deviceName;
-    }
-
-    // Update last login info
-    user.lastLoginTime = now;
-    user.lastLoginIP = ipAddress;
-    if (isNewDevice) {
-      user.deviceId = deviceId;
-    }
-    await user.save();
-
-    // Generate JWT
     const token = jwt.sign(
       { id: user._id, aadhaarNumber: user.aadhaarNumber },
-      process.env.JWT_SECRET,
-      { expiresIn: "2h" }
+      process.env.JWT_SECRET || "default_secret_key",
+      { expiresIn: "7d" }
     );
 
-    res.status(200).json({
-      message: "✅ Login successful",
+    await user.save();
+    console.log(token);
+
+    const userData = {
+      id: user._id,
+      name: user.name,
+      aadhaarNumber: user.aadhaarNumber,
+      accountNumber: user.accountNumber,
+      upiId: user.upiId,
+      balance: user.balance
+    };
+
+    res.json({
+      message: "Login successful",
       token,
-      isNewDevice,
-      cooldown_applied: isNewDevice && !user.deviceHistory?.find(d => d.deviceId === deviceId),
-      user: {
-        id: user._id,
-        name: user.name,
-        aadhaarNumber: user.aadhaarNumber,
-        panNumber: user.panNumber,
-        accountNumber: user.accountNumber
-      }
+      user: userData
     });
-  } catch (error) {
-    console.error("Login Error:", error);
+  } catch (err) {
+    console.error("Login error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-
-module.exports = router;
-
-// ==============================
-// ✅ ADMIN: GET ALL USERS
-// ==============================
 router.get("/admin/all-users", async (req, res) => {
   try {
-    // Optional pagination
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
 
     const users = await User.find()
-      .select("-mpinHash -__v") // ❌ hide sensitive data
+      .select("-mpinHash -__v")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -231,76 +160,21 @@ router.get("/admin/all-users", async (req, res) => {
       users
     });
   } catch (error) {
-    console.error("Fetch Users Error:", error);
-    res.status(500).json({ error: "Failed to fetch users" });
+    console.error("Get users error:", error);
+    res.status(500).json({ error: "Server error" });
   }
 });
-// ==============================
-// ✅ ADMIN: FREEZE USER ACCOUNT
-// ==============================
-router.post("/admin/freeze/:userId", async (req, res) => {
+
+router.post("/admin/add-balance/:userId", async (req, res) => {
   try {
+    const { amount, reason } = req.body;
     const user = await User.findById(req.params.userId);
 
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    user.status = "FROZEN";
-    await user.save();
-
-    res.json({
-      message: "User account frozen successfully",
-      userId: user._id,
-      status: user.status
-    });
-  } catch (err) {
-    console.error("Freeze error:", err);
-    res.status(500).json({ error: "Failed to freeze account" });
-  }
-});
-
-// ==============================
-// ✅ ADMIN: UNFREEZE USER ACCOUNT
-// ==============================
-router.post("/admin/unfreeze/:userId", async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId);
-
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    user.status = "ACTIVE";
-    await user.save();
-
-    res.json({
-      message: "User account unfrozen successfully",
-      userId: user._id,
-      status: user.status
-    });
-  } catch (err) {
-    console.error("Unfreeze error:", err);
-    res.status(500).json({ error: "Failed to unfreeze account" });
-  }
-});
-// ==============================
-// ✅ ADMIN: ADD BALANCE TO USER
-// ==============================
-router.post("/admin/add-balance", async (req, res) => {
-  try {
-    const { userId, amount, reason } = req.body;
-
-    if (!userId || !amount || amount <= 0) {
-      return res.status(400).json({ error: "Invalid request" });
-    }
-
-    const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
     const before = user.balance;
-    user.balance += Number(amount);
-    user.transactionsCount += 1;
+    user.balance += amount;
     await user.save();
-
-    // Optional: record as CREDIT transaction
-    const Transaction = require("../models/Transaction");
 
     await Transaction.create({
       txn_id: `ADMIN-${Date.now()}`,
@@ -324,43 +198,4 @@ router.post("/admin/add-balance", async (req, res) => {
   }
 });
 
-// ==============================
-// ✅ ADMIN: BYPASS DEVICE COOLDOWN
-// ==============================
-router.post("/admin/bypass-cooldown/:userId", async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    user.newDeviceCoolDownUntil = null;
-    await user.save();
-
-    res.json({ message: "Device cooldown bypassed", userId: user._id });
-  } catch (err) {
-    console.error("Bypass cooldown error:", err);
-    res.status(500).json({ error: "Failed to bypass cooldown" });
-  }
-});
-
-// ==============================
-// ✅ ADMIN: GET USER DEVICE HISTORY
-// ==============================
-router.get("/admin/device-history/:userId", async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    res.json({
-      deviceId: user.deviceId,
-      deviceHistory: user.deviceHistory || [],
-      lastLoginDevice: user.lastLoginDevice,
-      lastLoginTime: user.lastLoginTime,
-      lastLoginIP: user.lastLoginIP,
-      newDeviceCoolDownUntil: user.newDeviceCoolDownUntil
-    });
-  } catch (err) {
-    console.error("Device history error:", err);
-    res.status(500).json({ error: "Failed to get device history" });
-  }
-});
-
+module.exports = router;

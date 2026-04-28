@@ -219,15 +219,14 @@ router.post("/send", auth, async (req, res) => {
     // ---- Advanced Fraud Detection ----
     const fraudAnalysis = await advancedFraudCheck(user._id, amt, to_account);
     
-    // Check if last transaction was rapid
+    // Check if last transaction was within 24 hours
     const lastTxn = await Transaction.findOne({ user_id: user._id, type: 'DEBIT' }).sort({ createdAt: -1 });
-    let timeSinceLastTxn = null;
-    if (lastTxn) {
-      timeSinceLastTxn = (Date.now() - new Date(lastTxn.createdAt).getTime()) / 1000;
-    }
+    const hoursSinceLastTxn = lastTxn ? (Date.now() - new Date(lastTxn.createdAt).getTime()) / (1000 * 60 * 60) : null;
+    const hasRecentTransaction = hoursSinceLastTxn !== null && hoursSinceLastTxn < 24;
 
     // ---- Check sufficient balance for scheduled transaction ----
-    if (fraudAnalysis.needsDelay) {
+    if (fraudAnalysis.needsDelay && !hasRecentTransaction) {
+      // User hasn't made transaction in 24 hours - schedule with delay
       const scheduled_at = new Date(Date.now() + DELAY_DURATION_MS);
       
       const scheduledTxn = new ScheduledTransaction({
@@ -438,15 +437,13 @@ router.post("/upi/send", auth, async (req, res) => {
     // ---------- ADVANCED FRAUD CHECK FOR UPI ----------
     const fraudAnalysis = await advancedFraudCheck(user._id, amt, null);
 
-    // Check if last transaction was rapid
+    // Check if last transaction was within 24 hours
     const lastTxn = await Transaction.findOne({ user_id: user._id, type: 'DEBIT' }).sort({ createdAt: -1 });
-    let timeSinceLastTxn = null;
-    if (lastTxn) {
-      timeSinceLastTxn = (Date.now() - new Date(lastTxn.createdAt).getTime()) / 1000;
-    }
+    const hoursSinceLastTxn = lastTxn ? (Date.now() - new Date(lastTxn.createdAt).getTime()) / (1000 * 60 * 60) : null;
+    const hasRecentTransaction = hoursSinceLastTxn !== null && hoursSinceLastTxn < 24;
 
     // ---------- HIGH VALUE/SUSPICIOUS DELAY ----------
-    if (fraudAnalysis.needsDelay) {
+    if (fraudAnalysis.needsDelay && !hasRecentTransaction) {
       const scheduled_at = new Date(Date.now() + DELAY_DURATION_MS);
 
       const scheduledTxn = new ScheduledTransaction({
@@ -606,8 +603,30 @@ router.post("/upi/send", auth, async (req, res) => {
 router.get("/history", auth, async (req, res) => {
   try {
     const user = req.user;
-    const txns = await Transaction.find({ user_id: user._id }).sort({ createdAt: -1 }).limit(200);
-    res.json(txns);
+
+    const [txns, scheduledTxns] = await Promise.all([
+      Transaction.find({ user_id: user._id }),
+      ScheduledTransaction.find({ user_id: user._id })
+    ]);
+
+    // Add a flag to पहचान type (optional but useful in frontend)
+    const formattedTxns = txns.map(t => ({
+      ...t.toObject(),
+      type: "transaction"
+    }));
+
+    const formattedScheduled = scheduledTxns.map(t => ({
+      ...t.toObject(),
+      type: "scheduled"
+    }));
+
+    // Merge + sort by date
+    const combined = [...formattedTxns, ...formattedScheduled]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 200);
+
+    res.json(combined);
+
   } catch (err) {
     console.error("History error:", err);
     res.status(500).json({ error: "Server error" });
@@ -743,26 +762,30 @@ router.post("/report", auth, async (req, res) => {
 
 /**
  * GET /api/txns/scheduled
- * Get user's pending scheduled transactions
+ * Get user's scheduled transactions (all statuses: PENDING, APPROVED_BY_ADMIN, COMPLETED, CANCELLED, FAILED)
  */
 router.get("/scheduled", auth, async (req, res) => {
   try {
     const user = req.user;
-    const pendingTxns = await ScheduledTransaction.find({
+    const scheduledTxns = await ScheduledTransaction.find({
       user_id: user._id,
-      status: 'PENDING'
-    }).sort({ scheduled_at: 1 });
+      status: { $in: ['PENDING', 'APPROVED_BY_ADMIN', 'PROCESSING', 'COMPLETED', 'CANCELLED', 'FAILED'] }
+    }).sort({ createdAt: -1 });
 
     res.json({
-      count: pendingTxns.length,
-      transactions: pendingTxns.map(t => ({
+      count: scheduledTxns.length,
+      transactions: scheduledTxns.map(t => ({
+        id: t._id,
         txn_id: t.txn_id,
         amount: t.amount,
         to_account: maskAccount(t.to_account),
+        to_upi: t.to_upi,
         beneficiary_name: t.beneficiary_name,
         scheduled_at: t.scheduled_at,
+        processed_at: t.processed_at,
         delay_reason: t.delay_reason,
-        status: t.status
+        status: t.status,
+        createdAt: t.createdAt
       }))
     });
   } catch (err) {
@@ -815,8 +838,10 @@ router.delete("/scheduled/:txnId", auth, async (req, res) => {
 router.post("/process-scheduled", async (req, res) => {
   try {
     const now = new Date();
+    
+    // Auto-process scheduled transactions after delay (both PENDING and APPROVED_BY_ADMIN)
     const pendingTxns = await ScheduledTransaction.find({
-      status: 'PENDING',
+      status: { $in: ['PENDING', 'APPROVED_BY_ADMIN'] },
       scheduled_at: { $lte: now }
     }).populate('user_id');
 

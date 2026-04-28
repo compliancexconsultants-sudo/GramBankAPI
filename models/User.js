@@ -51,21 +51,7 @@ const userSchema = new mongoose.Schema({
   upiQR: {
     type: String,
     required: true // IMGBB hosted QR URL
-  },
-
-  // Device tracking for security
-  deviceId: { type: String, default: null },
-  lastLoginDevice: { type: String, default: null },
-  lastLoginTime: { type: Date, default: null },
-  lastLoginIP: { type: String, default: null },
-  newDeviceCoolDownUntil: { type: Date, default: null },
-  deviceHistory: [{
-    deviceId: String,
-    deviceName: String,
-    firstLoginAt: Date,
-    lastLoginAt: Date,
-    ipAddress: String
-  }]
+  }
 });
 
 module.exports = mongoose.model("User", userSchema);

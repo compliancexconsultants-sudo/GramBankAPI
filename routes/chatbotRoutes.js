@@ -59,12 +59,6 @@ const faqs = [
   {
     id: 10,
     category: "security",
-    question: "Why do I need to wait 1 hour for new device login?",
-    answer: "This is a security feature to protect your account. When you login from a new device, we add a 1-hour cooldown period to prevent unauthorized access. The device gets trusted after first login."
-  },
-  {
-    id: 11,
-    category: "security",
     question: "What is UPI Collect Request fraud?",
     answer: "UPI Collect allows anyone to request money from you. Scammers may send fake requests saying 'approve to receive money' but it actually sends money. Always verify the request intent - our app clearly shows SEND vs RECEIVE."
   },

@@ -228,14 +228,15 @@ router.get("/scheduled-transactions", async (req, res) => {
 router.post("/scheduled-transactions/:txnId/process", async (req, res) => {
   try {
     const { action } = req.body;
+    const ScheduledTransaction = require("../models/ScheduledTransaction");
     const txn = await ScheduledTransaction.findById(req.params.txnId);
     
     if (!txn) return res.status(404).json({ error: "Transaction not found" });
     
     if (action === "approve") {
-      txn.status = "COMPLETED";
+      txn.status = "APPROVED_BY_ADMIN";
       await txn.save();
-      res.json({ message: "Transaction completed" });
+      res.json({ message: "Transaction approved" });
     } else if (action === "reject") {
       txn.status = "CANCELLED";
       await txn.save();
